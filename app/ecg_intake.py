@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel
 
@@ -8,6 +8,9 @@ VALID_LEAD_COUNT = 12
 VALID_SAMPLING_RATES = {250, 500, 1000}
 MIN_SIGNAL_SECONDS = 5
 MIN_CONFIDENCE = 0.80
+
+Decision = Literal["accept", "reject", "needs_human_review"]
+Reason = Literal["lead_count", "sampling_rate", "signal_length", "low_confidence"]
 
 
 class IntakeRequest(BaseModel):
@@ -18,8 +21,8 @@ class IntakeRequest(BaseModel):
 
 
 class IntakeDecision(BaseModel):
-    decision: str
-    reason: Optional[str] = None
+    decision: Decision
+    reason: Optional[Reason] = None
 
 
 def evaluate_intake(request: IntakeRequest) -> IntakeDecision:
