@@ -1,0 +1,109 @@
+name: deploy-azure
+
+# CD(배포) — 진행자 전용(참가자는 Azure가 없으므로 실행하지 않는다).
+# 2브랜치 승격 모델의 릴리스 단계: main → (PR) → prod 머지가 완료되면 이 워크플로가 배포한다.
+# OIDC 단명 토큰으로 Azure에 로그인해 harness-rg 의 Container App(harness-container-app)에
+# 새 이미지를 배포한다. 컴퓨트는 VM이 아니라 Azure Container Apps(서버리스, scale-to-zero).
+#
+# prod 게이트: 이 잡은 environment: production 을 통과해야 한다. production 환경의
+# "배포 브랜치 정책"을 prod 한 브랜치로 제한하면, prod2 등 다른 브랜치에서 이 워크플로가
+# 트리거돼도 배포 게이트에서 막힌다(대조 시연). ruleset은 prod 브랜치 자체를 보호한다.
+on:
+  push:
+    branches: [prod, prod2] # prod2도 트리거는 되지만 environment 정책에서 막히는 걸 보여준다
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC — 장수 시크릿 없이 클라우드 인증
+  contents: read
+
+concurrency:
+  group: deploy-azure
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production # ← 배포 브랜치 정책(prod만 허용)에 걸리는 게이트. prod2는 여기서 차단됨.
+    env:
+      RG: harness-rg
+      APP: harness-container-app
+      IMAGE: harness-app
+    steps:
+      # Preflight — production 환경에 Azure 자격증명(OIDC secrets)이 없으면
+      # 실패시키지 않고 안내만 남긴 뒤 green 으로 끝낸다. 진행자만 이 트랙을 돌리고,
+      # 참가자가 템플릿을 그대로 prod 에 올려도 빨간 실패가 뜨지 않게 하는 가드.
+      - name: Preflight — Azure 자격증명 확인
+        id: preflight
+        env:
+          AZ_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZ_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZ_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          if [ -z "$AZ_CLIENT_ID" ] || [ -z "$AZ_TENANT_ID" ] || [ -z "$AZ_SUBSCRIPTION_ID" ]; then
+            echo "::notice::production 환경에 Azure 자격증명(AZURE_CLIENT_ID/AZURE_TENANT_ID/AZURE_SUBSCRIPTION_ID)이 없어 배포를 건너뜁니다. 진행자 전용 트랙이며, 시크릿을 설정하면 실배포가 돕니다."
+            echo "== deploy-azure: 배포 건너뜀 (Azure 미설정) =="
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.preflight.outputs.configured == 'true'
+
+      - name: Azure login (OIDC — no long-lived secret)
+        if: steps.preflight.outputs.configured == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure Container Apps CLI
+        if: steps.preflight.outputs.configured == 'true'
+        run: az extension add -n containerapp --upgrade --only-show-errors || true
+
+      - name: Resolve ACR name (terraform이 만든 전역 유일 이름)
+        if: steps.preflight.outputs.configured == 'true'
+        run: echo "ACR=$(az acr list -g "$RG" --query '[0].name' -o tsv)" >> "$GITHUB_ENV"
+
+      - name: Build image in ACR (클라우드 빌드 — 러너에 docker 불필요)
+        if: steps.preflight.outputs.configured == 'true'
+        run: az acr build -r "$ACR" -t "$IMAGE:${{ github.sha }}" .
+
+      - name: Wire ACR to the app (managed identity — 레지스트리 비밀번호 없음)
+        if: steps.preflight.outputs.configured == 'true'
+        run: |
+          # 앱의 시스템 아이덴티티로 ACR 를 붙인다(AcrPull 역할은 terraform 이 이미 부여).
+          # terraform 생성 시점엔 역할이 없어 registry 를 붙이면 provisioning 이 멈추므로
+          # 배포 시점(역할 유효)에 여기서 붙인다. 장수 비밀번호 없음 = 거버넌스 포인트.
+          az containerapp registry set -n "$APP" -g "$RG" \
+            --server "$ACR.azurecr.io" --identity system
+
+      - name: Deploy new image to Container App
+        if: steps.preflight.outputs.configured == 'true'
+        run: |
+          az containerapp update -n "$APP" -g "$RG" \
+            --image "$ACR.azurecr.io/$IMAGE:${{ github.sha }}"
+
+      - name: Configure ingress port
+        if: steps.preflight.outputs.configured == 'true'
+        run: |
+          # 의도된 버그: 앱은 컨테이너 8000 에서 listen 한다. 여기서 ingress 를 8080 으로 돌리면
+          # ACA 가 컨테이너에 붙지 못해 502 가 난다(배포는 성공처럼 보여도 엔드포인트가 죽음).
+          # CI(ci.yml)에는 안 보이는 배포-only 버그 → 찾아서 8080 을 8000 으로 고치면 초록.
+          az containerapp ingress update -n "$APP" -g "$RG" --target-port 8080
+
+      - name: Smoke test the deployed endpoint
+        if: steps.preflight.outputs.configured == 'true'
+        run: |
+          FQDN=$(az containerapp show -n "$APP" -g "$RG" --query properties.configuration.ingress.fqdn -o tsv)
+          echo "Deployed → https://$FQDN/"
+          up=""
+          for i in $(seq 1 20); do
+            if curl -fsS "https://$FQDN/openapi.json" >/dev/null 2>&1; then up=1; break; fi
+            sleep 6
+          done
+          [ -n "$up" ] || { echo "endpoint did not come up (ingress 포트 확인)"; exit 1; }
+          echo "== healthz =="
+          curl -s "https://$FQDN/healthz"; echo

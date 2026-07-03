@@ -1,0 +1,62 @@
+name: ci
+
+# 참가자용(Azure 불필요) — 테스트 → 컨테이너 이미지 빌드 → 이미지 아티팩트 업로드까지.
+# 클라우드 자격증명·레지스트리 불필요. 결과 이미지는 빌드 아티팩트로만 남긴다.
+#
+# 트리거(2브랜치 승격 모델):
+#   · main 으로의 PR / main 머지(push)  → ci (기능 통합 게이트)
+#   · prod 으로의 PR(= main → prod)      → ci (릴리스 전 검증)
+#   prod 머지 자체엔 ci 를 걸지 않는다 — 그때는 cd(deploy-azure)가 배포한다.
+on:
+  pull_request:
+    branches: [main, prod]
+  push:
+    branches: [main]
+
+jobs:
+  guard-prod-source:
+    # "main 만 prod 로 머지" 강제 장치. GitHub 룰셋엔 PR 소스 브랜치 제한이 없어,
+    # prod 로 향하는 PR 이 main 에서 왔는지 검사해 아니면 실패시킨다. 이 잡을 prod
+    # 룰셋의 required status check 로 걸면 feat→prod 직행 PR 은 머지 버튼이 잠긴다.
+    name: guard-prod-source
+    if: github.event_name == 'pull_request' && github.base_ref == 'prod'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only main may target prod
+        run: |
+          if [ "${{ github.head_ref }}" != "main" ]; then
+            echo "::error::prod 로의 PR 은 main 브랜치에서만 허용됩니다 (현재 head=${{ github.head_ref }})."
+            exit 1
+          fi
+          echo "OK: main → prod"
+
+  test:
+    # 시드 상태: healthz 스모크 테스트만 통과(초록). 핸즈온에서 게이트를 grill→구현하며
+    # 새 테스트를 red→green 으로 추가한다.
+    name: test (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  build-image:
+    # test가 초록이어야 이미지 빌드. 결과 이미지는 tar로 저장해 아티팩트 업로드(레지스트리/클라우드 불필요).
+    name: build-image (→ artifact)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container image
+        run: docker build -t harness-app:${{ github.sha }} .
+      - name: Export image to tar
+        run: docker save harness-app:${{ github.sha }} -o harness-app-image.tar
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-app-image
+          path: harness-app-image.tar
+          retention-days: 7

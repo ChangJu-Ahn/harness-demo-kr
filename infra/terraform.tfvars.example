@@ -1,0 +1,5 @@
+# 진행자 인프라 변수 예시. 기본값으로도 동작(koreacentral / harness-rg).
+# location            = "koreacentral"
+# resource_group_name = "harness-rg"
+# container_app_name  = "harness-container-app"
+# app_port            = 8000
